@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from uuid import UUID
 
+import msgspec
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from chattix.models.message import Message, MessageReaction
 from chattix.models.user import User
+from chattix.serialization.wire import MessagePayload
 
 
 async def message_to_out(session: AsyncSession, msg: Message) -> dict:
@@ -31,6 +33,11 @@ async def message_to_out(session: AsyncSession, msg: Message) -> dict:
         "created_at": msg.created_at.isoformat(),
         "reactions": reactions_out,
     }
+
+
+async def message_to_payload(session: AsyncSession, msg: Message) -> MessagePayload:
+    d = await message_to_out(session, msg)
+    return msgspec.convert(d, MessagePayload)
 
 
 async def load_message_with_relations(session: AsyncSession, message_id: UUID) -> Message | None:
