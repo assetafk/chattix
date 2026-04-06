@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import json
 import logging
-from typing import Any
 from uuid import UUID
 
+import msgspec
 import redis.asyncio as redis
 from litestar import WebSocket, websocket
 from litestar.exceptions import WebSocketException
@@ -14,7 +13,22 @@ from chattix.auth import decode_token
 from chattix.config import get_settings
 from chattix.db import SessionLocal
 from chattix.models import Message, RoomMember, User
-from chattix.services.messages import message_to_out
+from chattix.serialization.codec import decode_ws_client, encode_server_to_text
+from chattix.serialization.wire import (
+    WsChatMessage,
+    WsClientTyping,
+    WsError,
+    WsJoinRoom,
+    WsLeaveRoom,
+    WsLeft,
+    WsJoined,
+    WsPing,
+    WsPong,
+    WsPresence,
+    WsSendMessage,
+    WsServerTyping,
+)
+from chattix.services.messages import message_to_payload
 from chattix.services.redis_bus import (
     presence_clear,
     presence_refresh,
@@ -55,12 +69,11 @@ async def chat_socket(socket: WebSocket) -> None:
     )
     await publish_global(
         redis_client,
-        {
-            "type": "presence",
-            "user_id": str(user_id),
-            "username": username,
-            "status": "online",
-        },
+        WsPresence(
+            user_id=str(user_id),
+            username=username,
+            status="online",
+        ),
     )
 
     joined_rooms: set[str] = set()
@@ -75,114 +88,98 @@ async def chat_socket(socket: WebSocket) -> None:
             )
             return q.scalar_one_or_none() is not None
 
+    async def send_err(text: str) -> None:
+        await socket.send_text(encode_server_to_text(WsError(message=text)))
+
     try:
         while True:
             raw = await socket.receive_text()
             try:
-                data: dict[str, Any] = json.loads(raw)
-            except json.JSONDecodeError:
-                await socket.send_text(json.dumps({"type": "error", "message": "invalid json"}))
+                incoming = decode_ws_client(raw)
+            except (msgspec.DecodeError, msgspec.ValidationError):
+                await send_err("invalid message")
                 continue
 
-            msg_type = data.get("type")
-            if msg_type == "ping":
+            if isinstance(incoming, WsPing):
                 await presence_refresh(redis_client, user_id, settings.presence_ttl_seconds)
-                await socket.send_text(json.dumps({"type": "pong"}))
+                await socket.send_text(encode_server_to_text(WsPong()))
                 continue
 
-            if msg_type == "join_room":
-                rid = data.get("room_id")
+            if isinstance(incoming, WsJoinRoom):
+                rid = incoming.room_id.strip() if incoming.room_id else ""
                 if not rid:
-                    await socket.send_text(
-                        json.dumps({"type": "error", "message": "room_id required"})
-                    )
+                    await send_err("room_id required")
                     continue
                 try:
-                    room_uuid = UUID(str(rid))
+                    room_uuid = UUID(rid)
                 except ValueError:
-                    await socket.send_text(
-                        json.dumps({"type": "error", "message": "invalid room_id"})
-                    )
+                    await send_err("invalid room_id")
                     continue
                 if not await ensure_member(room_uuid):
-                    await socket.send_text(
-                        json.dumps({"type": "error", "message": "not a member"})
-                    )
+                    await send_err("not a member")
                     continue
                 rs = str(room_uuid)
                 await manager.join_room(rs, socket)
                 joined_rooms.add(rs)
-                await socket.send_text(json.dumps({"type": "joined", "room_id": rs}))
+                await socket.send_text(encode_server_to_text(WsJoined(room_id=rs)))
                 continue
 
-            if msg_type == "leave_room":
-                rid = data.get("room_id")
+            if isinstance(incoming, WsLeaveRoom):
                 left_id: str | None = None
-                if rid:
+                if incoming.room_id:
                     try:
-                        left_id = str(UUID(str(rid)))
+                        left_id = str(UUID(incoming.room_id))
                         await manager.leave_room(left_id, socket)
                         joined_rooms.discard(left_id)
                     except ValueError:
                         left_id = None
-                await socket.send_text(json.dumps({"type": "left", "room_id": left_id}))
+                await socket.send_text(encode_server_to_text(WsLeft(room_id=left_id)))
                 continue
 
-            if msg_type == "typing":
-                rid = data.get("room_id")
-                typing = bool(data.get("typing", False))
+            if isinstance(incoming, WsClientTyping):
+                rid = incoming.room_id.strip() if incoming.room_id else ""
                 if not rid:
                     continue
                 try:
-                    room_uuid = UUID(str(rid))
+                    room_uuid = UUID(rid)
                 except ValueError:
                     continue
                 rs = str(room_uuid)
                 if rs not in joined_rooms:
                     continue
-                wire = {
-                    "type": "typing",
-                    "room_id": rs,
-                    "user_id": str(user_id),
-                    "username": username,
-                    "typing": typing,
-                }
-                await publish_room(redis_client, room_uuid, wire)
+                await publish_room(
+                    redis_client,
+                    room_uuid,
+                    WsServerTyping(
+                        room_id=rs,
+                        user_id=str(user_id),
+                        username=username,
+                        typing=incoming.typing,
+                    ),
+                )
                 continue
 
-            if msg_type == "send_message":
-                rid = data.get("room_id")
-                content = (data.get("content") or "").strip()
-                attachment_url = data.get("attachment_url")
+            if isinstance(incoming, WsSendMessage):
+                rid = incoming.room_id.strip() if incoming.room_id else ""
+                content = (incoming.content or "").strip()
+                attachment_url = incoming.attachment_url
                 if not rid or not content:
-                    await socket.send_text(
-                        json.dumps({"type": "error", "message": "room_id and content required"})
-                    )
+                    await send_err("room_id and content required")
                     continue
                 try:
-                    room_uuid = UUID(str(rid))
+                    room_uuid = UUID(rid)
                 except ValueError:
-                    await socket.send_text(
-                        json.dumps({"type": "error", "message": "invalid room_id"})
-                    )
+                    await send_err("invalid room_id")
                     continue
                 rs = str(room_uuid)
                 if rs not in joined_rooms:
-                    await socket.send_text(
-                        json.dumps({"type": "error", "message": "join room first"})
-                    )
+                    await send_err("join room first")
                     continue
                 if not await ensure_member(room_uuid):
-                    await socket.send_text(
-                        json.dumps({"type": "error", "message": "not a member"})
-                    )
+                    await send_err("not a member")
                     continue
-                if attachment_url is not None and not isinstance(attachment_url, str):
-                    attachment_url = None
-                if attachment_url and len(attachment_url) > 512:
-                    await socket.send_text(
-                        json.dumps({"type": "error", "message": "attachment_url too long"})
-                    )
+                if attachment_url is not None and len(attachment_url) > 512:
+                    await send_err("attachment_url too long")
                     continue
 
                 async with SessionLocal() as session:
@@ -195,13 +192,12 @@ async def chat_socket(socket: WebSocket) -> None:
                     session.add(msg)
                     await session.commit()
                     await session.refresh(msg, ["author", "reactions"])
-                    payload = await message_to_out(session, msg)
+                    payload = await message_to_payload(session, msg)
 
-                wire = {"type": "message", "message": payload}
-                await publish_room(redis_client, room_uuid, wire)
+                await publish_room(redis_client, room_uuid, WsChatMessage(message=payload))
                 continue
 
-            await socket.send_text(json.dumps({"type": "error", "message": "unknown type"}))
+            await send_err("unknown type")
     except WebSocketException:
         raise
     except Exception as e:  # noqa: BLE001
@@ -214,11 +210,10 @@ async def chat_socket(socket: WebSocket) -> None:
         await presence_clear(redis_client, user_id)
         await publish_global(
             redis_client,
-            {
-                "type": "presence",
-                "user_id": str(user_id),
-                "username": username,
-                "status": "offline",
-            },
+            WsPresence(
+                user_id=str(user_id),
+                username=username,
+                status="offline",
+            ),
         )
         await redis_client.aclose()

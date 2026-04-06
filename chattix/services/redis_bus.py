@@ -1,12 +1,20 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 from uuid import UUID
 
+import msgspec
 import redis.asyncio as redis
+
+from chattix.serialization.codec import (
+    decode_global_envelope,
+    decode_room_envelope,
+    encode_global_envelope,
+    encode_room_envelope,
+)
+from chattix.serialization.wire import WsServerOutgoing
 
 if TYPE_CHECKING:
     from chattix.services.connection_manager import ConnectionManager
@@ -21,13 +29,13 @@ def room_channel(room_id: UUID) -> str:
     return f"{ROOM_PREFIX}{room_id}"
 
 
-async def publish_room(redis_client: redis.Redis, room_id: UUID, wire: dict[str, Any]) -> None:
-    body = json.dumps({"room_id": str(room_id), "wire": wire})
+async def publish_room(redis_client: redis.Redis, room_id: UUID, wire: WsServerOutgoing) -> None:
+    body = encode_room_envelope(str(room_id), wire).decode("utf-8")
     await redis_client.publish(room_channel(room_id), body)
 
 
-async def publish_global(redis_client: redis.Redis, wire: dict[str, Any]) -> None:
-    await redis_client.publish(GLOBAL_CHANNEL, json.dumps({"wire": wire}))
+async def publish_global(redis_client: redis.Redis, wire: WsServerOutgoing) -> None:
+    await redis_client.publish(GLOBAL_CHANNEL, encode_global_envelope(wire).decode("utf-8"))
 
 
 async def redis_listener_loop(
@@ -49,24 +57,19 @@ async def redis_listener_loop(
                 if raw is None:
                     continue
                 try:
-                    data = json.loads(raw)
-                except json.JSONDecodeError:
+                    wire = decode_global_envelope(raw)
+                except (msgspec.DecodeError, msgspec.ValidationError):
                     continue
-                wire = data.get("wire")
-                if isinstance(wire, dict):
-                    await manager.broadcast_global(wire)
+                await manager.broadcast_global(wire)
             elif mtype == "pmessage":
                 raw = msg.get("data")
                 if raw is None:
                     continue
                 try:
-                    data = json.loads(raw)
-                except json.JSONDecodeError:
+                    room_id, wire = decode_room_envelope(raw)
+                except (msgspec.DecodeError, msgspec.ValidationError):
                     continue
-                room_id = data.get("room_id")
-                wire = data.get("wire")
-                if isinstance(room_id, str) and isinstance(wire, dict):
-                    await manager.broadcast_room(room_id, wire)
+                await manager.broadcast_room(room_id, wire)
     except asyncio.CancelledError:
         raise
     except Exception:

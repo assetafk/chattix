@@ -1,5 +1,6 @@
 from uuid import UUID
 
+import msgspec
 import redis.asyncio as redis
 from litestar import Request, Router, delete, get, patch, post
 from litestar.exceptions import ClientException
@@ -12,7 +13,13 @@ from chattix.db import SessionLocal
 from chattix.dependencies import current_user_id_from_request
 from chattix.models import Message, MessageReaction, RoomMember, User
 from chattix.schemas import MessageOut, MessagePatch, ReactionBody
-from chattix.services.messages import load_message_with_relations, message_to_out
+from chattix.serialization.wire import (
+    WsMessageDeleted,
+    WsMessageEdited,
+    WsReactionAdded,
+    WsReactionRemoved,
+)
+from chattix.services.messages import load_message_with_relations, message_to_out, message_to_payload
 from chattix.services.redis_bus import publish_room
 
 
@@ -80,11 +87,10 @@ async def edit_message(request: Request, message_id: UUID, data: MessagePatch) -
         msg.edited_at = datetime.now(timezone.utc)
         await session.commit()
         await session.refresh(msg)
-        payload = await message_to_out(session, msg)
-        wire = {"type": "message_edited", "message": payload}
-        await publish_room(r, msg.room_id, wire)
+        payload = await message_to_payload(session, msg)
+        await publish_room(r, msg.room_id, WsMessageEdited(message=payload))
     await r.aclose()
-    return MessageOut.model_validate(payload)
+    return MessageOut.model_validate(msgspec.to_builtins(payload))
 
 
 @delete("/messages/{message_id:uuid}")
@@ -100,8 +106,11 @@ async def delete_message(request: Request, message_id: UUID) -> None:
         msg.deleted = True
         msg.content = ""
         await session.commit()
-        wire = {"type": "message_deleted", "room_id": str(msg.room_id), "message_id": str(msg.id)}
-        await publish_room(r, msg.room_id, wire)
+        await publish_room(
+            r,
+            msg.room_id,
+            WsMessageDeleted(room_id=str(msg.room_id), message_id=str(msg.id)),
+        )
     await r.aclose()
 
 
@@ -127,20 +136,22 @@ async def add_reaction(request: Request, message_id: UUID, data: ReactionBody) -
             )
             await session.commit()
         await session.refresh(msg)
-        payload = await message_to_out(session, msg)
+        payload = await message_to_payload(session, msg)
         user = await session.get(User, user_id)
-        wire = {
-            "type": "reaction_added",
-            "room_id": str(msg.room_id),
-            "message_id": str(message_id),
-            "emoji": data.emoji,
-            "user_id": str(user_id),
-            "username": user.username if user else "",
-            "message": payload,
-        }
-        await publish_room(r, msg.room_id, wire)
+        await publish_room(
+            r,
+            msg.room_id,
+            WsReactionAdded(
+                room_id=str(msg.room_id),
+                message_id=str(message_id),
+                emoji=data.emoji,
+                user_id=str(user_id),
+                username=user.username if user else "",
+                message=payload,
+            ),
+        )
     await r.aclose()
-    return MessageOut.model_validate(payload)
+    return MessageOut.model_validate(msgspec.to_builtins(payload))
 
 
 @delete("/messages/{message_id:uuid}/reactions", status_code=200)
@@ -168,18 +179,22 @@ async def remove_reaction(
             await session.delete(row)
             await session.commit()
         await session.refresh(msg)
-        payload = await message_to_out(session, msg)
-        wire = {
-            "type": "reaction_removed",
-            "room_id": str(msg.room_id),
-            "message_id": str(message_id),
-            "emoji": emoji,
-            "user_id": str(user_id),
-            "message": payload,
-        }
-        await publish_room(r, msg.room_id, wire)
+        payload = await message_to_payload(session, msg)
+        actor = await session.get(User, user_id)
+        await publish_room(
+            r,
+            msg.room_id,
+            WsReactionRemoved(
+                room_id=str(msg.room_id),
+                message_id=str(message_id),
+                emoji=emoji,
+                user_id=str(user_id),
+                username=actor.username if actor else "",
+                message=payload,
+            ),
+        )
     await r.aclose()
-    return MessageOut.model_validate(payload)
+    return MessageOut.model_validate(msgspec.to_builtins(payload))
 
 
 messages_router = Router(path="", route_handlers=[list_messages, edit_message, delete_message, add_reaction, remove_reaction])

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from collections import defaultdict
-from typing import Any
 
 from litestar.connection import WebSocket
+
+from chattix.serialization.codec import encode_server_to_text
+from chattix.serialization.wire import WsServerOutgoing
 
 logger = logging.getLogger(__name__)
 
@@ -50,14 +51,14 @@ class ConnectionManager:
             for rid in empty:
                 del self._rooms[rid]
 
-    async def broadcast_room(self, room_id: str, message: dict[str, Any]) -> None:
-        payload = json.dumps(message)
+    async def broadcast_room(self, room_id: str, message: WsServerOutgoing) -> None:
+        payload = encode_server_to_text(message)
         async with self._lock:
             targets = list(self._rooms.get(room_id, ()))
         await self._send_many(targets, payload)
 
-    async def broadcast_global(self, message: dict[str, Any]) -> None:
-        payload = json.dumps(message)
+    async def broadcast_global(self, message: WsServerOutgoing) -> None:
+        payload = encode_server_to_text(message)
         async with self._lock:
             targets = list(self._global_clients)
         await self._send_many(targets, payload)
